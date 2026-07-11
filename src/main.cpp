@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_task_wdt.h>
+#include <math.h>
 #include <time.h>
 
 #if __has_include(<esp_idf_version.h>)
@@ -19,11 +20,15 @@ const char* WIFI_PASSWORD = "nnKP7TnTrYErjMeP";
 
 // Hardware pins
 const int LAMP_PIN = 13;
+// GPIO34 is an ADC1 input-only pin and remains available while Wi-Fi is active.
 const int SOIL_SENSOR_PIN = 34;
 const int SOIL_POWER_PIN = 32;
+// GPIO15 is an ESP32 boot-strapping pin. If boot becomes unstable or slow,
+// check the DHT pull-up wiring or move DHT_PIN to a non-strapping GPIO.
 const int DHT_PIN = 15;
 
-const bool LAMP_ACTIVE_HIGH = true;
+// The relay input is active LOW: LOW turns the lamp on, HIGH turns it off.
+const bool LAMP_ACTIVE_HIGH = false;
 
 // Magdeburg, Germany
 const float LATITUDE = 52.1205;
@@ -36,12 +41,15 @@ const int SOIL_DRY_VALUE = 3000;
 const int SOIL_WET_VALUE = 1200;
 
 // Periodic tasks
-const unsigned long DHT_INTERVAL_MS = 10000;
-const unsigned long SOIL_INTERVAL_MS = 60000;
-const unsigned long WEATHER_INTERVAL_MS = 60000;
+const unsigned long SENSOR_STEP_INTERVAL_MS = 3000;
+const unsigned long WEATHER_SUCCESS_INTERVAL_MS = 15UL * 60UL * 1000UL;
+const unsigned long WEATHER_RETRY_INTERVAL_MS = 60000;
+const unsigned long WEATHER_INITIAL_DELAY_MS = 5000;
 const unsigned long SCHEDULE_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
 const unsigned long SOIL_STABILIZE_MS = 600;
+const unsigned long SENSOR_LOG_INTERVAL_MS = 60000;
+const int SENSOR_HISTORY_SIZE = 60;
 
 #define DHTTYPE DHT22
 
@@ -92,6 +100,17 @@ struct WeatherState {
   uint8_t sunsetMinute = 0;
   bool sunsetValid = false;
   time_t updatedAt = 0;
+  int httpCode = 0;
+  char error[96] = "";
+};
+
+struct SensorLogEntry {
+  uint32_t epoch = 0;
+  int16_t temperatureC10 = 0;
+  uint16_t airHumidity10 = 0;
+  uint8_t soilPercent = 0;
+  uint16_t soilRaw = 0;
+  uint8_t flags = 0;
 };
 
 Preferences preferences;
@@ -100,22 +119,25 @@ DHT dht(DHT_PIN, DHTTYPE);
 Settings settings;
 SensorState sensors;
 WeatherState weather;
+SensorLogEntry sensorHistory[SENSOR_HISTORY_SIZE];
 
 bool lampOn = false;
 time_t lampTurnedOnEpoch = 0;
 
-unsigned long lastDhtRead = 0;
-unsigned long lastSoilStart = 0;
+unsigned long lastSensorStep = 0;
 unsigned long soilPowerStartedAt = 0;
 unsigned long lastWeatherFetch = 0;
+unsigned long weatherFetchInterval = WEATHER_INITIAL_DELAY_MS;
 unsigned long lastScheduleCheck = 0;
 unsigned long lastWiFiReconnectAttempt = 0;
+unsigned long lastSensorLog = 0;
 bool soilMeasurementActive = false;
+bool nextSensorStepIsDht = true;
+uint16_t sensorHistoryCount = 0;
+uint16_t sensorHistoryNextIndex = 0;
 
-int lastAutoOnYday = -1;
-int lastAutoOnMinuteOfDay = -1;
-int lastAutoOffYday = -1;
-int lastAutoOffMinuteOfDay = -1;
+int lastScheduleEventDay = -1;
+int lastScheduleEventMinute = -1;
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -212,6 +234,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     button.primary { background: var(--green); color: #fff; border-color: var(--green); }
     button.warn { background: var(--amber); color: #fff; border-color: var(--amber); }
     button.ghost.active { background: #e8f2ec; border-color: var(--green); color: var(--green); }
+    button.lamp-toggle { min-width: 190px; }
+    em.inline-time {
+      color: var(--blue);
+      font-style: italic;
+      font-weight: 650;
+    }
     label {
       display: inline-flex;
       align-items: center;
@@ -287,11 +315,46 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       justify-content: flex-end;
       padding-top: 2px;
     }
+    .chart-panel {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+      gap: 14px;
+      align-items: stretch;
+    }
+    canvas {
+      width: 100%;
+      height: 220px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfa;
+    }
+    .legend {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 5px;
+    }
+    .analysis {
+      display: grid;
+      gap: 8px;
+      align-content: start;
+      color: var(--muted);
+      line-height: 1.4;
+    }
     @media (max-width: 900px) {
       .span-3, .span-4, .span-5, .span-6, .span-7 { grid-column: span 12; }
       header { align-items: flex-start; flex-direction: column; }
       .time { text-align: left; }
       .weather { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .chart-panel { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       main { width: min(100% - 18px, 1180px); }
@@ -323,8 +386,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div id="lampState" class="status">Вимкнена</div>
       </div>
       <div class="row">
-        <button class="primary" onclick="lamp('on')">Увімкнути лампу</button>
-        <button class="warn" onclick="lamp('off')">Вимкнути лампу</button>
+        <button id="lampToggle" class="primary lamp-toggle" onclick="toggleLamp()">Увімкнути лампу</button>
       </div>
       <p class="sub" id="lampHint">Ручне керування працює незалежно від розкладу.</p>
     </section>
@@ -336,7 +398,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <label><input name="onMode" value="time" type="radio"> За часом</label>
         <input id="onTime" type="time">
       </div>
-      <label><input name="onMode" value="sunset" type="radio"> За заходом сонця</label>
+      <label><input name="onMode" value="sunset" type="radio"> За заходом сонця <em class="inline-time" id="sunsetAutoTime">--:--</em></label>
     </section>
 
     <section class="span-4 stack">
@@ -397,7 +459,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div class="gauge" id="tempGauge" style="--gauge-color: var(--amber)"><span id="tempValue">--°C</span></div>
         <div class="metric">
           <strong>Температура повітря</strong>
-          <small>DHT22 · GPIO33</small>
+          <small>DHT22 · GPIO15</small>
         </div>
       </div>
     </section>
@@ -407,8 +469,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div class="gauge" id="humGauge" style="--gauge-color: var(--blue)"><span id="humValue">--%</span></div>
         <div class="metric">
           <strong>Вологість повітря</strong>
-          <small>DHT22 · GPIO33</small>
+          <small>DHT22 · GPIO15</small>
         </div>
+      </div>
+    </section>
+
+    <section class="span-12 stack">
+      <div class="row between">
+        <h2>Графіки та аналіз</h2>
+        <p class="sub" id="historyInfo">Історія завантажується</p>
+      </div>
+      <div class="chart-panel">
+        <div class="stack">
+          <canvas id="historyChart" width="920" height="260"></canvas>
+          <div class="legend">
+            <span><span class="dot" style="background: var(--amber)"></span>Температура</span>
+            <span><span class="dot" style="background: var(--blue)"></span>Вологість повітря</span>
+            <span><span class="dot" style="background: var(--green)"></span>Вологість ґрунту</span>
+          </div>
+        </div>
+        <div class="analysis" id="chartAnalysis">Потрібно щонайменше два збережені вимірювання.</div>
       </div>
     </section>
   </div>
@@ -421,10 +501,15 @@ let hydrated = false;
 let baseEpoch = 0;
 let baseMillis = 0;
 let offTimerMinutes = 0;
+let currentLampOn = false;
+let historyRows = [];
 
 function pad(n) { return String(n).padStart(2, '0'); }
 function setText(id, value) { document.getElementById(id).textContent = value; }
 function timeValue(h, m) { return `${pad(h)}:${pad(m)}`; }
+function minuteLabel(value) {
+  return value >= 0 ? `${pad(Math.floor(value / 60))}:${pad(value % 60)}` : '--:--';
+}
 
 function renderDays() {
   const wrap = document.getElementById('days');
@@ -486,9 +571,27 @@ function setGauge(id, value, min = 0, max = 100) {
   document.getElementById(id).style.setProperty('--value', normalized.toFixed(0));
 }
 
+function setSoilGauge(value) {
+  const gauge = document.getElementById('soilGauge');
+  const percent = Math.max(0, Math.min(100, value));
+  const color = percent < 20 ? 'var(--red)' : percent < 60 ? 'var(--amber)' : 'var(--green)';
+  gauge.style.setProperty('--gauge-color', color);
+  setGauge('soilGauge', percent);
+}
+
+function soilGradeText(value) {
+  if (value < 20) return 'сухо';
+  if (value < 60) return 'середньо';
+  return 'добре';
+}
+
 async function lamp(action) {
   await fetch(`/api/lamp/${action}`, { method: 'POST' });
   await loadStatus();
+}
+
+async function toggleLamp() {
+  await lamp(currentLampOn ? 'off' : 'on');
 }
 
 async function saveSettings() {
@@ -506,11 +609,15 @@ async function saveSettings() {
     offTimerMinutes,
     activeDaysMask: mask
   };
-  await fetch('/api/settings', {
+  const response = await fetch('/api/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+  if (!response.ok) {
+    setText('lampHint', 'Не вдалося зберегти розклад. Перевірте вибраний час.');
+    return;
+  }
   hydrated = false;
   await loadStatus();
 }
@@ -526,12 +633,16 @@ async function loadStatus() {
       renderClock();
     }
     const lampState = document.getElementById('lampState');
+    const lampToggle = document.getElementById('lampToggle');
+    currentLampOn = data.lampOn;
     lampState.textContent = data.lampOn ? 'Увімкнена' : 'Вимкнена';
     lampState.classList.toggle('on', data.lampOn);
+    lampToggle.textContent = data.lampOn ? 'Вимкнути лампу' : 'Увімкнути лампу';
+    lampToggle.className = data.lampOn ? 'warn lamp-toggle' : 'primary lamp-toggle';
     if (data.sensors.soil.valid) {
       setText('soilValue', `${data.sensors.soil.percent}%`);
-      setText('soilRaw', `GPIO34 · raw ${data.sensors.soil.raw}`);
-      setGauge('soilGauge', data.sensors.soil.percent);
+      setText('soilRaw', `GPIO34 · raw ${data.sensors.soil.raw} · ${soilGradeText(data.sensors.soil.percent)}`);
+      setSoilGauge(data.sensors.soil.percent);
     }
     if (data.sensors.dht.valid) {
       setText('tempValue', `${data.sensors.dht.temperature.toFixed(1)}°C`);
@@ -544,7 +655,32 @@ async function loadStatus() {
       setText('weatherTomorrow', `${data.weather.tomorrowMin.toFixed(0)}…${data.weather.tomorrowMax.toFixed(0)}°C · ${data.weather.tomorrowText}`);
       setText('sunrise', data.weather.sunrise || '--:--');
       setText('sunset', data.weather.sunset || '--:--');
+      setText('sunsetAutoTime', data.weather.sunset || '--:--');
       setText('weatherUpdated', data.weather.updatedAt || 'Open-Meteo');
+    } else {
+      setText('weatherNow', '--');
+      setText('weatherTomorrow', '--');
+      setText('sunrise', '--:--');
+      setText('sunset', '--:--');
+      setText('sunsetAutoTime', data.weather.sunset || '--:--');
+      setText('weatherUpdated', data.weather.error ? `Open-Meteo: ${data.weather.error}` : 'Open-Meteo');
+    }
+    if (!data.timeValid) {
+      setText('lampHint', 'Розклад очікує синхронізацію часу через інтернет.');
+    } else if (data.schedule.autoOnEnabled && data.schedule.onMode === 'sunset' && !data.weather.sunsetValid) {
+      setText('lampHint', 'Розклад за заходом очікує дані Open-Meteo.');
+    } else if (!data.schedule.activeToday) {
+      setText('lampHint', 'Сьогодні не вибрано в днях розкладу.');
+    } else {
+      const onText = data.schedule.autoOnEnabled
+        ? `увімкнення ${minuteLabel(data.schedule.onTargetMinute)}`
+        : 'автоввімкнення вимкнене';
+      const offText = data.schedule.autoOffEnabled
+        ? (data.schedule.offMode === 'timer'
+            ? `вимкнення через ${data.schedule.offTimerMinutes} хв`
+            : `вимкнення ${minuteLabel(data.schedule.offTargetMinute)}`)
+        : 'автовимкнення вимкнене';
+      setText('lampHint', `Сьогодні: ${onText}; ${offText}.`);
     }
     if (!hydrated) hydrateSettings(data);
   } catch (error) {
@@ -552,11 +688,97 @@ async function loadStatus() {
   }
 }
 
+function drawHistoryChart() {
+  const canvas = document.getElementById('historyChart');
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  const pad = 34;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#fbfcfa';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = '#dce4da';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad + (height - pad * 2) * i / 4;
+    ctx.beginPath();
+    ctx.moveTo(pad, y);
+    ctx.lineTo(width - pad, y);
+    ctx.stroke();
+  }
+  if (historyRows.length < 2) return;
+
+  function point(index, value, min, max) {
+    const x = pad + (width - pad * 2) * index / (historyRows.length - 1);
+    const y = height - pad - (height - pad * 2) * Math.max(0, Math.min(1, (value - min) / (max - min)));
+    return { x, y };
+  }
+  function line(key, color, min, max) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    historyRows.forEach((row, index) => {
+      if (row[key] === null || row[key] === undefined) return;
+      const p = point(index, row[key], min, max);
+      if (!started) {
+        ctx.moveTo(p.x, p.y);
+        started = true;
+      } else {
+        ctx.lineTo(p.x, p.y);
+      }
+    });
+    ctx.stroke();
+  }
+  line('temperature', '#d99028', -10, 45);
+  line('airHumidity', '#3572a5', 0, 100);
+  line('soilPercent', '#2f8c57', 0, 100);
+}
+
+function summarizeSeries(label, rows, key, unit) {
+  const values = rows.map(row => row[key]).filter(value => typeof value === 'number');
+  if (values.length < 2) return `${label}: замало даних.`;
+  const first = values[0];
+  const last = values[values.length - 1];
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const diff = last - first;
+  const trend = Math.abs(diff) < 0.5 ? 'стабільно' : diff > 0 ? 'зростає' : 'знижується';
+  return `${label}: ${trend}, зараз ${last.toFixed(1)}${unit}, середнє ${avg.toFixed(1)}${unit}.`;
+}
+
+function analyzeHistory() {
+  const box = document.getElementById('chartAnalysis');
+  if (historyRows.length < 2) {
+    box.textContent = 'Потрібно щонайменше два збережені вимірювання.';
+    return;
+  }
+  box.innerHTML = [
+    summarizeSeries('Температура', historyRows, 'temperature', '°C'),
+    summarizeSeries('Вологість повітря', historyRows, 'airHumidity', '%'),
+    summarizeSeries('Вологість ґрунту', historyRows, 'soilPercent', '%')
+  ].map(text => `<p>${text}</p>`).join('');
+}
+
+async function loadHistory() {
+  try {
+    const response = await fetch('/api/history');
+    const data = await response.json();
+    historyRows = data.history || [];
+    setText('historyInfo', `${historyRows.length} записів, збереження 1 раз/хв`);
+    drawHistoryChart();
+    analyzeHistory();
+  } catch (error) {
+    setText('historyInfo', 'Історія недоступна');
+  }
+}
+
 renderDays();
 updateTimerButtons();
 loadStatus();
+loadHistory();
 setInterval(renderClock, 1000);
 setInterval(loadStatus, 10000);
+setInterval(loadHistory, 60000);
 </script>
 </body>
 </html>
@@ -572,12 +794,15 @@ int lampInactiveLevel() {
 
 void setLamp(bool on) {
   lampOn = on;
-  digitalWrite(LAMP_PIN, on ? lampActiveLevel() : lampInactiveLevel());
+  int outputLevel = on ? lampActiveLevel() : lampInactiveLevel();
+  digitalWrite(LAMP_PIN, outputLevel);
   if (on) {
     time(&lampTurnedOnEpoch);
   } else {
     lampTurnedOnEpoch = 0;
   }
+  Serial.printf("Lamp: %s, GPIO%d=%s\n",
+                on ? "on" : "off", LAMP_PIN, outputLevel == HIGH ? "HIGH" : "LOW");
 }
 
 bool localTime(tm& out) {
@@ -743,15 +968,17 @@ void readDht() {
   }
 }
 
-void updateSoilSensor() {
-  unsigned long nowMs = millis();
-  if (!soilMeasurementActive && nowMs - lastSoilStart >= SOIL_INTERVAL_MS) {
-    soilMeasurementActive = true;
-    soilPowerStartedAt = nowMs;
-    lastSoilStart = nowMs;
-    digitalWrite(SOIL_POWER_PIN, HIGH);
+void startSoilMeasurement() {
+  if (soilMeasurementActive) {
+    return;
   }
+  soilMeasurementActive = true;
+  soilPowerStartedAt = millis();
+  digitalWrite(SOIL_POWER_PIN, HIGH);
+}
 
+void finishSoilMeasurementIfReady() {
+  unsigned long nowMs = millis();
   if (!soilMeasurementActive || nowMs - soilPowerStartedAt < SOIL_STABILIZE_MS) {
     return;
   }
@@ -773,12 +1000,8 @@ void updateSoilSensor() {
   }
 }
 
-void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=";
+String weatherUrl(const char* scheme) {
+  String url = String(scheme) + "://api.open-meteo.com/v1/forecast?latitude=";
   url += String(LATITUDE, 4);
   url += "&longitude=";
   url += String(LONGITUDE, 4);
@@ -786,26 +1009,21 @@ void fetchWeather() {
   url += "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset";
   url += "&forecast_days=2&timezone=";
   url += OPEN_METEO_TIMEZONE;
+  return url;
+}
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(5000);
-  if (!http.begin(client, url)) {
-    return;
-  }
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return;
-  }
-
+bool parseWeatherPayload(const String& payload) {
   DynamicJsonDocument doc(8192);
-  DeserializationError error = deserializeJson(doc, http.getStream());
-  http.end();
+  DeserializationError error = deserializeJson(doc, payload);
   if (error) {
-    return;
+    snprintf(weather.error, sizeof(weather.error), "JSON: %s", error.c_str());
+    return false;
+  }
+
+  if (doc["error"] | false) {
+    const char* reason = doc["reason"] | "API error";
+    snprintf(weather.error, sizeof(weather.error), "API: %.80s", reason);
+    return false;
   }
 
   JsonVariant currentTemp = doc["current"]["temperature_2m"];
@@ -829,11 +1047,173 @@ void fetchWeather() {
 
   time(&weather.updatedAt);
   weather.valid = !isnan(weather.currentTemp);
+  if (weather.valid) {
+    weather.error[0] = '\0';
+  } else {
+    strlcpy(weather.error, "missing current temperature", sizeof(weather.error));
+  }
+  return weather.valid;
+}
+
+bool fetchWeatherHttps(const String& url) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(12000);
+#if defined(ESP_IDF_VERSION_MAJOR)
+  client.setHandshakeTimeout(10);
+#endif
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(12000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) {
+    strlcpy(weather.error, "HTTPS begin failed", sizeof(weather.error));
+    return false;
+  }
+
+  http.addHeader("User-Agent", "ESP32-Lamp/1.0");
+  http.addHeader("Connection", "close");
+  esp_task_wdt_reset();
+  weather.httpCode = http.GET();
+  if (weather.httpCode != HTTP_CODE_OK) {
+    String detail = HTTPClient::errorToString(weather.httpCode);
+    snprintf(weather.error, sizeof(weather.error), "HTTPS %d: %.64s", weather.httpCode, detail.c_str());
+    Serial.printf("Open-Meteo request failed: %s\n", weather.error);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  esp_task_wdt_reset();
+  bool ok = parseWeatherPayload(payload);
+  if (!ok) {
+    Serial.printf("Open-Meteo response failed: %s, bytes=%u\n", weather.error, payload.length());
+  }
+  return ok;
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    strlcpy(weather.error, "Wi-Fi disconnected", sizeof(weather.error));
+    return;
+  }
+
+  weather.httpCode = 0;
+  fetchWeatherHttps(weatherUrl("https"));
+}
+
+void loadSensorHistory() {
+  preferences.begin("sensorHistory", true);
+  sensorHistoryCount = preferences.getUShort("count", 0);
+  sensorHistoryNextIndex = preferences.getUShort("next", 0);
+  if (sensorHistoryCount > SENSOR_HISTORY_SIZE) {
+    sensorHistoryCount = 0;
+  }
+  if (sensorHistoryNextIndex >= SENSOR_HISTORY_SIZE) {
+    sensorHistoryNextIndex = 0;
+  }
+  size_t bytes = preferences.getBytesLength("entries");
+  if (bytes == sizeof(sensorHistory)) {
+    preferences.getBytes("entries", sensorHistory, sizeof(sensorHistory));
+  }
+  preferences.end();
+}
+
+void saveSensorHistory() {
+  preferences.begin("sensorHistory", false);
+  preferences.putUShort("count", sensorHistoryCount);
+  preferences.putUShort("next", sensorHistoryNextIndex);
+  preferences.putBytes("entries", sensorHistory, sizeof(sensorHistory));
+  preferences.end();
+}
+
+void logSensorSnapshot() {
+  if (!sensors.dhtValid && !sensors.soilValid) {
+    return;
+  }
+
+  SensorLogEntry entry;
+  time_t epoch;
+  time(&epoch);
+  entry.epoch = static_cast<uint32_t>(epoch);
+  if (sensors.dhtValid) {
+    entry.temperatureC10 = static_cast<int16_t>(lroundf(sensors.airTemperature * 10.0f));
+    entry.airHumidity10 = static_cast<uint16_t>(lroundf(sensors.airHumidity * 10.0f));
+    entry.flags |= 0x01;
+  }
+  if (sensors.soilValid) {
+    entry.soilPercent = static_cast<uint8_t>(sensors.soilPercent);
+    entry.soilRaw = static_cast<uint16_t>(sensors.soilRaw);
+    entry.flags |= 0x02;
+  }
+
+  sensorHistory[sensorHistoryNextIndex] = entry;
+  sensorHistoryNextIndex = (sensorHistoryNextIndex + 1) % SENSOR_HISTORY_SIZE;
+  if (sensorHistoryCount < SENSOR_HISTORY_SIZE) {
+    sensorHistoryCount++;
+  }
+  saveSensorHistory();
+}
+
+void updateSensorHistory() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastSensorLog >= SENSOR_LOG_INTERVAL_MS) {
+    lastSensorLog = nowMs;
+    logSensorSnapshot();
+  }
+}
+
+void updateSensors() {
+  finishSoilMeasurementIfReady();
+  unsigned long nowMs = millis();
+  if (nowMs - lastSensorStep < SENSOR_STEP_INTERVAL_MS || soilMeasurementActive) {
+    return;
+  }
+  lastSensorStep = nowMs;
+  if (nextSensorStepIsDht) {
+    readDht();
+  } else {
+    startSoilMeasurement();
+  }
+  nextSensorStepIsDht = !nextSensorStepIsDht;
 }
 
 bool isScheduleDayActive(const tm& now) {
   int mondayBasedIndex = (now.tm_wday + 6) % 7;
   return settings.activeDaysMask & (1 << mondayBasedIndex);
+}
+
+int configuredOnTargetMinute() {
+  if (!settings.autoOnEnabled) {
+    return -1;
+  }
+  if (settings.onMode == ON_MODE_TIME) {
+    return settings.onHour * 60 + settings.onMinute;
+  }
+  return weather.sunsetValid ? weather.sunsetHour * 60 + weather.sunsetMinute : -1;
+}
+
+int configuredOffTargetMinute() {
+  if (!settings.autoOffEnabled || settings.offMode != OFF_MODE_TIME) {
+    return -1;
+  }
+  return settings.offHour * 60 + settings.offMinute;
+}
+
+void runDueScheduleEvent(bool turnOn, int targetMinute, int minuteOfDay, int dayKey) {
+  if (targetMinute < 0 || targetMinute > minuteOfDay) {
+    return;
+  }
+  if (lastScheduleEventDay == dayKey && targetMinute <= lastScheduleEventMinute) {
+    return;
+  }
+
+  setLamp(turnOn);
+  lastScheduleEventDay = dayKey;
+  lastScheduleEventMinute = targetMinute;
+  Serial.printf("Schedule: lamp %s at %02d:%02d\n",
+                turnOn ? "on" : "off", targetMinute / 60, targetMinute % 60);
 }
 
 void checkSchedule() {
@@ -843,39 +1223,27 @@ void checkSchedule() {
   }
 
   int minuteOfDay = now.tm_hour * 60 + now.tm_min;
+  int dayKey = (now.tm_year + 1900) * 400 + now.tm_yday;
+  int onTargetMinute = configuredOnTargetMinute();
+  int offTargetMinute = configuredOffTargetMinute();
 
-  if (settings.autoOnEnabled) {
-    int targetMinute = -1;
-    if (settings.onMode == ON_MODE_TIME) {
-      targetMinute = settings.onHour * 60 + settings.onMinute;
-    } else if (weather.sunsetValid) {
-      targetMinute = weather.sunsetHour * 60 + weather.sunsetMinute;
+  // Catch up missed events in chronological order. This survives slow network
+  // requests, brief Wi-Fi outages, and restarts after the exact target minute.
+  if (onTargetMinute >= 0 && offTargetMinute >= 0) {
+    if (onTargetMinute <= offTargetMinute) {
+      runDueScheduleEvent(true, onTargetMinute, minuteOfDay, dayKey);
+      runDueScheduleEvent(false, offTargetMinute, minuteOfDay, dayKey);
+    } else {
+      runDueScheduleEvent(false, offTargetMinute, minuteOfDay, dayKey);
+      runDueScheduleEvent(true, onTargetMinute, minuteOfDay, dayKey);
     }
-
-    if (targetMinute == minuteOfDay &&
-        (lastAutoOnYday != now.tm_yday || lastAutoOnMinuteOfDay != minuteOfDay)) {
-      setLamp(true);
-      lastAutoOnYday = now.tm_yday;
-      lastAutoOnMinuteOfDay = minuteOfDay;
-    }
+  } else {
+    runDueScheduleEvent(true, onTargetMinute, minuteOfDay, dayKey);
+    runDueScheduleEvent(false, offTargetMinute, minuteOfDay, dayKey);
   }
 
-  if (!settings.autoOffEnabled) {
-    return;
-  }
-
-  if (settings.offMode == OFF_MODE_TIME) {
-    int targetMinute = settings.offHour * 60 + settings.offMinute;
-    if (targetMinute == minuteOfDay &&
-        (lastAutoOffYday != now.tm_yday || lastAutoOffMinuteOfDay != minuteOfDay)) {
-      setLamp(false);
-      lastAutoOffYday = now.tm_yday;
-      lastAutoOffMinuteOfDay = minuteOfDay;
-    }
-    return;
-  }
-
-  if (settings.offMode == OFF_MODE_TIMER && lampOn && settings.offTimerMinutes > 0 && lampTurnedOnEpoch > 0) {
+  if (settings.autoOffEnabled && settings.offMode == OFF_MODE_TIMER &&
+      lampOn && settings.offTimerMinutes > 0 && lampTurnedOnEpoch > 0) {
     time_t nowEpoch;
     time(&nowEpoch);
     if (nowEpoch - lampTurnedOnEpoch >= static_cast<time_t>(settings.offTimerMinutes) * 60) {
@@ -919,7 +1287,10 @@ void addStatusJson(JsonDocument& doc) {
   weatherRoot["tomorrowText"] = weather.tomorrowText;
   weatherRoot["sunrise"] = weather.sunrise;
   weatherRoot["sunset"] = weather.sunset;
+  weatherRoot["sunsetValid"] = weather.sunsetValid;
   weatherRoot["updatedAt"] = weather.updatedAt > 0 ? localTimeString(weather.updatedAt) : "";
+  weatherRoot["httpCode"] = weather.httpCode;
+  weatherRoot["error"] = weather.error;
 
   JsonObject schedule = doc.createNestedObject("schedule");
   schedule["autoOnEnabled"] = settings.autoOnEnabled;
@@ -932,11 +1303,45 @@ void addStatusJson(JsonDocument& doc) {
   schedule["offMinute"] = settings.offMinute;
   schedule["offTimerMinutes"] = settings.offTimerMinutes;
   schedule["activeDaysMask"] = settings.activeDaysMask;
+  schedule["activeToday"] = hasTime && isScheduleDayActive(now);
+  schedule["onTargetMinute"] = configuredOnTargetMinute();
+  schedule["offTargetMinute"] = configuredOffTargetMinute();
 }
 
 void sendJsonStatus() {
   DynamicJsonDocument doc(6144);
   addStatusJson(doc);
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+void sendJsonHistory() {
+  DynamicJsonDocument doc(12288);
+  doc["count"] = sensorHistoryCount;
+  JsonArray history = doc.createNestedArray("history");
+  int start = sensorHistoryCount < SENSOR_HISTORY_SIZE ? 0 : sensorHistoryNextIndex;
+  for (uint16_t i = 0; i < sensorHistoryCount; i++) {
+    int index = (start + i) % SENSOR_HISTORY_SIZE;
+    const SensorLogEntry& entry = sensorHistory[index];
+    JsonObject item = history.createNestedObject();
+    item["epoch"] = entry.epoch;
+    item["time"] = entry.epoch > 0 ? localTimeString(entry.epoch) : "";
+    if (entry.flags & 0x01) {
+      item["temperature"] = entry.temperatureC10 / 10.0f;
+      item["airHumidity"] = entry.airHumidity10 / 10.0f;
+    } else {
+      item["temperature"] = nullptr;
+      item["airHumidity"] = nullptr;
+    }
+    if (entry.flags & 0x02) {
+      item["soilPercent"] = entry.soilPercent;
+      item["soilRaw"] = entry.soilRaw;
+    } else {
+      item["soilPercent"] = nullptr;
+      item["soilRaw"] = nullptr;
+    }
+  }
   String output;
   serializeJson(doc, output);
   server.send(200, "application/json", output);
@@ -997,6 +1402,9 @@ void handleSettings() {
   }
 
   saveSettings();
+  lastScheduleEventDay = -1;
+  lastScheduleEventMinute = -1;
+  checkSchedule();
   sendJsonStatus();
 }
 
@@ -1005,6 +1413,7 @@ void setupRoutes() {
     server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
   });
   server.on("/api/status", HTTP_GET, sendJsonStatus);
+  server.on("/api/history", HTTP_GET, sendJsonHistory);
   server.on("/api/lamp/on", HTTP_POST, []() {
     setLamp(true);
     sendJsonStatus();
@@ -1030,16 +1439,19 @@ void setup() {
   setLamp(false);
 
   analogReadResolution(12);
+  analogSetPinAttenuation(SOIL_SENSOR_PIN, ADC_11db);
   dht.begin();
   loadSettings();
+  loadSensorHistory();
   connectWiFi();
   setupTime();
   setupRoutes();
   server.begin();
 
-  lastDhtRead = millis() - DHT_INTERVAL_MS;
-  lastSoilStart = millis() - SOIL_INTERVAL_MS;
-  lastWeatherFetch = millis() - WEATHER_INTERVAL_MS;
+  lastSensorStep = millis() - SENSOR_STEP_INTERVAL_MS;
+  lastSensorLog = millis();
+  lastWeatherFetch = millis();
+  weatherFetchInterval = WEATHER_INITIAL_DELAY_MS;
 }
 
 void loop() {
@@ -1052,16 +1464,13 @@ void loop() {
     WiFi.reconnect();
   }
 
-  if (nowMs - lastDhtRead >= DHT_INTERVAL_MS) {
-    lastDhtRead = nowMs;
-    readDht();
-  }
+  updateSensors();
+  updateSensorHistory();
 
-  updateSoilSensor();
-
-  if (nowMs - lastWeatherFetch >= WEATHER_INTERVAL_MS) {
+  if (nowMs - lastWeatherFetch >= weatherFetchInterval) {
     lastWeatherFetch = nowMs;
     fetchWeather();
+    weatherFetchInterval = weather.valid ? WEATHER_SUCCESS_INTERVAL_MS : WEATHER_RETRY_INTERVAL_MS;
   }
 
   if (nowMs - lastScheduleCheck >= SCHEDULE_INTERVAL_MS) {

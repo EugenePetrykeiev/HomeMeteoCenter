@@ -14,14 +14,14 @@
 #endif
 
 // Wi-Fi settings
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID = "Vodafone-56D3";
+const char* WIFI_PASSWORD = "nnKP7TnTrYErjMeP";
 
 // Hardware pins
-const int LAMP_PIN = 21;
+const int LAMP_PIN = 13;
 const int SOIL_SENSOR_PIN = 34;
 const int SOIL_POWER_PIN = 32;
-const int DHT_PIN = 33;
+const int DHT_PIN = 15;
 
 const bool LAMP_ACTIVE_HIGH = true;
 

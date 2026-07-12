@@ -36,4 +36,4 @@ const char* TIMEZONE = "CET-1CEST,M3.5.0,M10.5.0/3";
 ```
 
 Open-Meteo is queried without an API key for Magdeburg coordinates.
-Sensor readings are saved once per minute in ESP32 flash via `Preferences`, so the web page can show the latest history after reboot.
+Sensor readings are saved once per minute in a seven-day circular LittleFS log (up to 10,080 records), so the web page can show trends after reboot without exhausting RAM or NVS storage.

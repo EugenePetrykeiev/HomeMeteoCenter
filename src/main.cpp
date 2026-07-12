@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -49,7 +50,11 @@ const unsigned long SCHEDULE_INTERVAL_MS = 1000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
 const unsigned long SOIL_STABILIZE_MS = 600;
 const unsigned long SENSOR_LOG_INTERVAL_MS = 60000;
-const int SENSOR_HISTORY_SIZE = 60;
+const uint16_t SENSOR_HISTORY_DAYS = 7;
+const uint16_t SENSOR_HISTORY_SIZE = SENSOR_HISTORY_DAYS * 24 * 60;
+const uint16_t HISTORY_API_MAX_POINTS = 480;
+const char* SENSOR_HISTORY_PATH = "/sensor-history.bin";
+const uint32_t SENSOR_HISTORY_MAGIC = 0x53484C47;
 
 #define DHTTYPE DHT22
 
@@ -104,14 +109,26 @@ struct WeatherState {
   char error[96] = "";
 };
 
-struct SensorLogEntry {
+struct __attribute__((packed)) SensorLogEntry {
   uint32_t epoch = 0;
   int16_t temperatureC10 = 0;
   uint16_t airHumidity10 = 0;
-  uint8_t soilPercent = 0;
   uint16_t soilRaw = 0;
+  uint8_t soilPercent = 0;
   uint8_t flags = 0;
 };
+
+struct __attribute__((packed)) SensorHistoryHeader {
+  uint32_t magic = SENSOR_HISTORY_MAGIC;
+  uint16_t version = 1;
+  uint16_t recordSize = sizeof(SensorLogEntry);
+  uint16_t capacity = SENSOR_HISTORY_SIZE;
+  uint16_t count = 0;
+  uint16_t nextIndex = 0;
+  uint16_t reserved = 0;
+};
+
+static_assert(sizeof(SensorLogEntry) == 12, "Unexpected sensor history record size");
 
 Preferences preferences;
 WebServer server(80);
@@ -119,7 +136,7 @@ DHT dht(DHT_PIN, DHTTYPE);
 Settings settings;
 SensorState sensors;
 WeatherState weather;
-SensorLogEntry sensorHistory[SENSOR_HISTORY_SIZE];
+SensorHistoryHeader sensorHistoryHeader;
 
 bool lampOn = false;
 time_t lampTurnedOnEpoch = 0;
@@ -133,8 +150,7 @@ unsigned long lastWiFiReconnectAttempt = 0;
 unsigned long lastSensorLog = 0;
 bool soilMeasurementActive = false;
 bool nextSensorStepIsDht = true;
-uint16_t sensorHistoryCount = 0;
-uint16_t sensorHistoryNextIndex = 0;
+bool sensorHistoryReady = false;
 
 int lastScheduleEventDay = -1;
 int lastScheduleEventMinute = -1;
@@ -323,7 +339,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
     canvas {
       width: 100%;
-      height: 220px;
+      height: 260px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #fbfcfa;
@@ -481,7 +497,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
       <div class="chart-panel">
         <div class="stack">
-          <canvas id="historyChart" width="920" height="260"></canvas>
+          <canvas id="historyChart" width="920" height="300"></canvas>
           <div class="legend">
             <span><span class="dot" style="background: var(--amber)"></span>Температура</span>
             <span><span class="dot" style="background: var(--blue)"></span>Вологість повітря</span>
@@ -693,24 +709,77 @@ function drawHistoryChart() {
   const ctx = canvas.getContext('2d');
   const width = canvas.width;
   const height = canvas.height;
-  const pad = 34;
+  const plot = { left: 58, right: 54, top: 22, bottom: 48 };
+  const plotWidth = width - plot.left - plot.right;
+  const plotHeight = height - plot.top - plot.bottom;
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = '#fbfcfa';
   ctx.fillRect(0, 0, width, height);
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+
+  // Y axes: humidity on the left, temperature on the right.
   ctx.strokeStyle = '#dce4da';
   ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = pad + (height - pad * 2) * i / 4;
+  for (let i = 0; i <= 5; i++) {
+    const ratio = i / 5;
+    const y = plot.top + plotHeight * ratio;
     ctx.beginPath();
-    ctx.moveTo(pad, y);
-    ctx.lineTo(width - pad, y);
+    ctx.moveTo(plot.left, y);
+    ctx.lineTo(width - plot.right, y);
     ctx.stroke();
+    ctx.fillStyle = '#647067';
+    ctx.textAlign = 'right';
+    ctx.fillText(`${Math.round(100 * (1 - ratio))}%`, plot.left - 8, y);
+    ctx.textAlign = 'left';
+    ctx.fillText(`${Math.round(45 - 55 * ratio)}°`, width - plot.right + 8, y);
   }
+  ctx.fillStyle = '#647067';
+  ctx.textAlign = 'left';
+  ctx.fillText('Вологість, %', plot.left, 10);
+  ctx.textAlign = 'right';
+  ctx.fillText('Температура, °C', width - plot.right, 10);
+
   if (historyRows.length < 2) return;
 
-  function point(index, value, min, max) {
-    const x = pad + (width - pad * 2) * index / (historyRows.length - 1);
-    const y = height - pad - (height - pad * 2) * Math.max(0, Math.min(1, (value - min) / (max - min)));
+  const validEpochs = historyRows.map(row => row.epoch).filter(epoch => epoch > 0);
+  const firstEpoch = validEpochs.length ? validEpochs[0] : 0;
+  const lastEpoch = validEpochs.length ? validEpochs[validEpochs.length - 1] : 0;
+  const epochSpan = Math.max(1, lastEpoch - firstEpoch);
+
+  // X axis uses the actual sample timestamps.
+  ctx.strokeStyle = '#9fac9f';
+  ctx.beginPath();
+  ctx.moveTo(plot.left, height - plot.bottom);
+  ctx.lineTo(width - plot.right, height - plot.bottom);
+  ctx.stroke();
+  const xTicks = 5;
+  for (let i = 0; i < xTicks; i++) {
+    const ratio = i / (xTicks - 1);
+    const x = plot.left + plotWidth * ratio;
+    const epoch = firstEpoch + epochSpan * ratio;
+    const date = new Date(epoch * 1000);
+    const label = epochSpan >= 24 * 3600
+      ? date.toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : date.toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
+    ctx.strokeStyle = '#9fac9f';
+    ctx.beginPath();
+    ctx.moveTo(x, height - plot.bottom);
+    ctx.lineTo(x, height - plot.bottom + 5);
+    ctx.stroke();
+    ctx.fillStyle = '#647067';
+    ctx.textAlign = i === 0 ? 'left' : i === xTicks - 1 ? 'right' : 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(label, x, height - plot.bottom + 9);
+  }
+  ctx.textBaseline = 'middle';
+
+  function point(row, index, value, min, max) {
+    const epochRatio = row.epoch > 0
+      ? (row.epoch - firstEpoch) / epochSpan
+      : index / (historyRows.length - 1);
+    const x = plot.left + plotWidth * Math.max(0, Math.min(1, epochRatio));
+    const y = plot.top + plotHeight * (1 - Math.max(0, Math.min(1, (value - min) / (max - min))));
     return { x, y };
   }
   function line(key, color, min, max) {
@@ -720,7 +789,7 @@ function drawHistoryChart() {
     let started = false;
     historyRows.forEach((row, index) => {
       if (row[key] === null || row[key] === undefined) return;
-      const p = point(index, row[key], min, max);
+      const p = point(row, index, row[key], min, max);
       if (!started) {
         ctx.moveTo(p.x, p.y);
         started = true;
@@ -764,7 +833,10 @@ async function loadHistory() {
     const response = await fetch('/api/history');
     const data = await response.json();
     historyRows = data.history || [];
-    setText('historyInfo', `${historyRows.length} записів, збереження 1 раз/хв`);
+    const sampling = data.sampleMinutes > 1
+      ? `графік: ${historyRows.length} точок, крок ≈${data.sampleMinutes} хв`
+      : `графік: ${historyRows.length} точок`;
+    setText('historyInfo', `${data.count || 0} із ${data.capacity || 10080} записів · ${data.retentionDays || 7} днів · ${sampling}`);
     drawHistoryChart();
     analyzeHistory();
   } catch (error) {
@@ -1103,29 +1175,126 @@ void fetchWeather() {
   fetchWeatherHttps(weatherUrl("https"));
 }
 
-void loadSensorHistory() {
-  preferences.begin("sensorHistory", true);
-  sensorHistoryCount = preferences.getUShort("count", 0);
-  sensorHistoryNextIndex = preferences.getUShort("next", 0);
-  if (sensorHistoryCount > SENSOR_HISTORY_SIZE) {
-    sensorHistoryCount = 0;
+bool writeSensorHistoryHeader(File& file) {
+  if (!file.seek(0, SeekSet)) {
+    return false;
   }
-  if (sensorHistoryNextIndex >= SENSOR_HISTORY_SIZE) {
-    sensorHistoryNextIndex = 0;
-  }
-  size_t bytes = preferences.getBytesLength("entries");
-  if (bytes == sizeof(sensorHistory)) {
-    preferences.getBytes("entries", sensorHistory, sizeof(sensorHistory));
-  }
-  preferences.end();
+  return file.write(reinterpret_cast<const uint8_t*>(&sensorHistoryHeader),
+                    sizeof(sensorHistoryHeader)) == sizeof(sensorHistoryHeader);
 }
 
-void saveSensorHistory() {
-  preferences.begin("sensorHistory", false);
-  preferences.putUShort("count", sensorHistoryCount);
-  preferences.putUShort("next", sensorHistoryNextIndex);
-  preferences.putBytes("entries", sensorHistory, sizeof(sensorHistory));
+bool appendSensorHistoryEntry(const SensorLogEntry& entry) {
+  if (!sensorHistoryReady) {
+    return false;
+  }
+
+  File file = LittleFS.open(SENSOR_HISTORY_PATH, "r+");
+  if (!file) {
+    return false;
+  }
+
+  size_t offset = sizeof(SensorHistoryHeader) +
+                  static_cast<size_t>(sensorHistoryHeader.nextIndex) * sizeof(SensorLogEntry);
+  bool written = file.seek(offset, SeekSet) &&
+                 file.write(reinterpret_cast<const uint8_t*>(&entry), sizeof(entry)) == sizeof(entry);
+  if (written) {
+    sensorHistoryHeader.nextIndex = (sensorHistoryHeader.nextIndex + 1) % SENSOR_HISTORY_SIZE;
+    if (sensorHistoryHeader.count < SENSOR_HISTORY_SIZE) {
+      sensorHistoryHeader.count++;
+    }
+    written = writeSensorHistoryHeader(file);
+  }
+  file.flush();
+  file.close();
+  return written;
+}
+
+void migrateLegacySensorHistory() {
+  struct LegacySensorLogEntry {
+    uint32_t epoch;
+    int16_t temperatureC10;
+    uint16_t airHumidity10;
+    uint8_t soilPercent;
+    uint16_t soilRaw;
+    uint8_t flags;
+  };
+
+  constexpr uint16_t LEGACY_CAPACITY = 60;
+  LegacySensorLogEntry legacy[LEGACY_CAPACITY] = {};
+  preferences.begin("sensorHistory", true);
+  uint16_t count = min(preferences.getUShort("count", 0), LEGACY_CAPACITY);
+  uint16_t next = preferences.getUShort("next", 0);
+  size_t bytes = preferences.getBytesLength("entries");
+  if (bytes == sizeof(legacy)) {
+    preferences.getBytes("entries", legacy, sizeof(legacy));
+  } else {
+    count = 0;
+  }
   preferences.end();
+
+  int start = count < LEGACY_CAPACITY ? 0 : next % LEGACY_CAPACITY;
+  for (uint16_t i = 0; i < count; i++) {
+    const LegacySensorLogEntry& oldEntry = legacy[(start + i) % LEGACY_CAPACITY];
+    SensorLogEntry entry;
+    entry.epoch = oldEntry.epoch;
+    entry.temperatureC10 = oldEntry.temperatureC10;
+    entry.airHumidity10 = oldEntry.airHumidity10;
+    entry.soilRaw = oldEntry.soilRaw;
+    entry.soilPercent = oldEntry.soilPercent;
+    entry.flags = oldEntry.flags;
+    appendSensorHistoryEntry(entry);
+  }
+  if (count > 0) {
+    Serial.printf("History: migrated %u legacy records\n", count);
+  }
+}
+
+void loadSensorHistory() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("History: LittleFS mount failed");
+    return;
+  }
+
+  bool createNew = !LittleFS.exists(SENSOR_HISTORY_PATH);
+  if (!createNew) {
+    File file = LittleFS.open(SENSOR_HISTORY_PATH, "r");
+    SensorHistoryHeader stored;
+    bool valid = file &&
+                 file.read(reinterpret_cast<uint8_t*>(&stored), sizeof(stored)) == sizeof(stored) &&
+                 stored.magic == SENSOR_HISTORY_MAGIC && stored.version == 1 &&
+                 stored.recordSize == sizeof(SensorLogEntry) &&
+                 stored.capacity == SENSOR_HISTORY_SIZE &&
+                 stored.count <= SENSOR_HISTORY_SIZE && stored.nextIndex < SENSOR_HISTORY_SIZE;
+    size_t expectedRecords = valid && stored.count == SENSOR_HISTORY_SIZE
+                               ? SENSOR_HISTORY_SIZE : (valid ? stored.count : 0);
+    valid = valid && file.size() >= sizeof(SensorHistoryHeader) +
+                              expectedRecords * sizeof(SensorLogEntry);
+    if (file) file.close();
+    if (valid) {
+      sensorHistoryHeader = stored;
+    } else {
+      createNew = true;
+      LittleFS.remove(SENSOR_HISTORY_PATH);
+    }
+  }
+
+  if (createNew) {
+    sensorHistoryHeader = SensorHistoryHeader();
+    File file = LittleFS.open(SENSOR_HISTORY_PATH, "w");
+    if (!file || !writeSensorHistoryHeader(file)) {
+      Serial.println("History: cannot create storage file");
+      if (file) file.close();
+      return;
+    }
+    file.close();
+  }
+
+  sensorHistoryReady = true;
+  if (createNew) {
+    migrateLegacySensorHistory();
+  }
+  Serial.printf("History: %u/%u records ready\n",
+                sensorHistoryHeader.count, SENSOR_HISTORY_SIZE);
 }
 
 void logSensorSnapshot() {
@@ -1148,12 +1317,9 @@ void logSensorSnapshot() {
     entry.flags |= 0x02;
   }
 
-  sensorHistory[sensorHistoryNextIndex] = entry;
-  sensorHistoryNextIndex = (sensorHistoryNextIndex + 1) % SENSOR_HISTORY_SIZE;
-  if (sensorHistoryCount < SENSOR_HISTORY_SIZE) {
-    sensorHistoryCount++;
+  if (!appendSensorHistoryEntry(entry)) {
+    Serial.println("History: record write failed");
   }
-  saveSensorHistory();
 }
 
 void updateSensorHistory() {
@@ -1316,35 +1482,94 @@ void sendJsonStatus() {
   server.send(200, "application/json", output);
 }
 
+bool readSensorHistoryEntry(File& file, uint16_t logicalIndex, SensorLogEntry& entry) {
+  if (logicalIndex >= sensorHistoryHeader.count) {
+    return false;
+  }
+  uint16_t start = sensorHistoryHeader.count < SENSOR_HISTORY_SIZE
+                     ? 0 : sensorHistoryHeader.nextIndex;
+  uint16_t physicalIndex = (start + logicalIndex) % SENSOR_HISTORY_SIZE;
+  size_t offset = sizeof(SensorHistoryHeader) +
+                  static_cast<size_t>(physicalIndex) * sizeof(SensorLogEntry);
+  return file.seek(offset, SeekSet) &&
+         file.read(reinterpret_cast<uint8_t*>(&entry), sizeof(entry)) == sizeof(entry);
+}
+
 void sendJsonHistory() {
-  DynamicJsonDocument doc(12288);
-  doc["count"] = sensorHistoryCount;
-  JsonArray history = doc.createNestedArray("history");
-  int start = sensorHistoryCount < SENSOR_HISTORY_SIZE ? 0 : sensorHistoryNextIndex;
-  for (uint16_t i = 0; i < sensorHistoryCount; i++) {
-    int index = (start + i) % SENSOR_HISTORY_SIZE;
-    const SensorLogEntry& entry = sensorHistory[index];
-    JsonObject item = history.createNestedObject();
-    item["epoch"] = entry.epoch;
-    item["time"] = entry.epoch > 0 ? localTimeString(entry.epoch) : "";
-    if (entry.flags & 0x01) {
-      item["temperature"] = entry.temperatureC10 / 10.0f;
-      item["airHumidity"] = entry.airHumidity10 / 10.0f;
-    } else {
-      item["temperature"] = nullptr;
-      item["airHumidity"] = nullptr;
+  if (!sensorHistoryReady) {
+    server.send(503, "application/json", "{\"error\":\"history storage unavailable\"}");
+    return;
+  }
+
+  File file = LittleFS.open(SENSOR_HISTORY_PATH, "r");
+  if (!file) {
+    server.send(503, "application/json", "{\"error\":\"history file unavailable\"}");
+    return;
+  }
+
+  uint16_t stride = (sensorHistoryHeader.count + HISTORY_API_MAX_POINTS - 1) /
+                    HISTORY_API_MAX_POINTS;
+  if (stride == 0) stride = 1;
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  String chunk = "{\"count\":" + String(sensorHistoryHeader.count) +
+                 ",\"capacity\":" + String(SENSOR_HISTORY_SIZE) +
+                 ",\"retentionDays\":" + String(SENSOR_HISTORY_DAYS) +
+                 ",\"sampleMinutes\":" + String(stride) + ",\"history\":[";
+  server.sendContent(chunk);
+  chunk = "";
+  chunk.reserve(1400);
+
+  bool first = true;
+  for (uint16_t groupStart = 0; groupStart < sensorHistoryHeader.count; groupStart += stride) {
+    uint16_t groupEnd = min(sensorHistoryHeader.count,
+                            static_cast<uint16_t>(groupStart + stride));
+    uint32_t epoch = 0;
+    int32_t temperatureSum = 0;
+    uint32_t humiditySum = 0;
+    uint32_t soilPercentSum = 0;
+    uint32_t soilRawSum = 0;
+    uint16_t dhtCount = 0;
+    uint16_t soilCount = 0;
+
+    for (uint16_t i = groupStart; i < groupEnd; i++) {
+      SensorLogEntry entry;
+      if (!readSensorHistoryEntry(file, i, entry)) continue;
+      if (entry.epoch > 0) epoch = entry.epoch;
+      if (entry.flags & 0x01) {
+        temperatureSum += entry.temperatureC10;
+        humiditySum += entry.airHumidity10;
+        dhtCount++;
+      }
+      if (entry.flags & 0x02) {
+        soilPercentSum += entry.soilPercent;
+        soilRawSum += entry.soilRaw;
+        soilCount++;
+      }
     }
-    if (entry.flags & 0x02) {
-      item["soilPercent"] = entry.soilPercent;
-      item["soilRaw"] = entry.soilRaw;
-    } else {
-      item["soilPercent"] = nullptr;
-      item["soilRaw"] = nullptr;
+
+    if (!first) chunk += ',';
+    first = false;
+    chunk += "{\"epoch\":" + String(epoch) + ",\"temperature\":";
+    chunk += dhtCount ? String(temperatureSum / (10.0f * dhtCount), 1) : "null";
+    chunk += ",\"airHumidity\":";
+    chunk += dhtCount ? String(humiditySum / (10.0f * dhtCount), 1) : "null";
+    chunk += ",\"soilPercent\":";
+    chunk += soilCount ? String(soilPercentSum / static_cast<float>(soilCount), 1) : "null";
+    chunk += ",\"soilRaw\":";
+    chunk += soilCount ? String(soilRawSum / soilCount) : "null";
+    chunk += '}';
+
+    if (chunk.length() >= 1200) {
+      server.sendContent(chunk);
+      chunk = "";
+      esp_task_wdt_reset();
     }
   }
-  String output;
-  serializeJson(doc, output);
-  server.send(200, "application/json", output);
+  if (chunk.length() > 0) server.sendContent(chunk);
+  server.sendContent("]}");
+  server.sendContent("");
+  file.close();
 }
 
 bool updateSettingsFromJson(const JsonDocument& doc) {
